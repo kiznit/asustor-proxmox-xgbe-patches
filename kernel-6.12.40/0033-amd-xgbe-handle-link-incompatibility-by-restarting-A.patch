@@ -1,0 +1,61 @@
+From 4e254f04d8fe0d7fe4578a50bdaa3e50a64a3f46 Mon Sep 17 00:00:00 2001
+From: Raju Rangoju <Raju.Rangoju@amd.com>
+Date: Fri, 24 Jan 2025 12:38:51 +0530
+Subject: [PATCH 033/127] amd-xgbe: handle link incompatibility by restarting
+ AN
+
+During the stress hotplug/unplug tests, the hardware may generate the
+incompatible-link interrupt to notify about the changes in the link.
+However, if we are in kr only mode, we may fail to reattempt the AN.
+Handle this corner case for Inphi phy by restarting the AN.
+
+This will help to start a fresh auto-neg cycle, leading to potential
+link up.
+
+Fixes: 84fe68eb67f9 ("net: amd-xgbe: Reset link when the link never comes back")
+Signed-off-by: Raju Rangoju <Raju.Rangoju@amd.com>
+Change-Id: I9db5886173963c02ce66d7858958fa1e1ce3ffb0
+Signed-off-by: amlakshm <AmmuThivya.LakshmiS@amd.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 63413c968..4f51bc0d3 100755
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@ -2483,6 +2483,19 @@ static void xgbe_phy_power_off(struct xgbe_prv_data *pdata)
+ 	netif_dbg(pdata, link, pdata->netdev, "phy powered off\n");
+ }
+ 
++static bool xgbe_is_inphi(struct xgbe_prv_data *pdata)
++{
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	/* Re-driver models 4223 && 4227 are supported inphi models */
++	if (phy_data->redrv &&
++	    (phy_data->redrv_model == XGBE_PHY_REDRV_MODEL_4223 ||
++	     phy_data->redrv_model == XGBE_PHY_REDRV_MODEL_4227))
++		return true;
++	else
++		return false;
++}
++
+ static bool enable_rx_adap(struct xgbe_prv_data *pdata, enum xgbe_mode mode)
+ {
+ 	struct xgbe_phy_data *phy_data = pdata->phy_data;
+@@ -3207,8 +3220,9 @@ static int xgbe_get_phy_link_status(struct xgbe_prv_data *pdata, int *an_restart
+ 	} else if (reg & MDIO_STAT1_LSTATUS)
+ 		return 1;
+ 
+-	if (pdata->phy.autoneg == AUTONEG_ENABLE &&
+-	    phy_data->port_mode == XGBE_PORT_MODE_BACKPLANE) {
++	if (xgbe_is_inphi(pdata) ||
++	    (pdata->phy.autoneg == AUTONEG_ENABLE &&
++	     phy_data->port_mode == XGBE_PORT_MODE_BACKPLANE)) {
+ 		if (!test_bit(XGBE_LINK_INIT, &pdata->dev_state)) {
+ 			netif_carrier_off(pdata->netdev);
+ 			*an_restart = 1;
+-- 
+2.34.1
+

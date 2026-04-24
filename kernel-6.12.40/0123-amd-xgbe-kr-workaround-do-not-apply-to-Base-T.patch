@@ -1,0 +1,45 @@
+From d41099e258ae4cf0b7d76895b31beadf41cfbeda Mon Sep 17 00:00:00 2001
+From: Raju Rangoju <Raju.Rangoju@amd.com>
+Date: Thu, 11 Sep 2025 20:05:53 +0530
+Subject: [PATCH 123/127] amd-xgbe: kr workaround do not apply to Base-T
+
+10G KR AN changes do not apply to Base-T port modes.
+
+Signed-off-by: Raju Rangoju <Raju.Rangoju@amd.com>
+Signed-off-by: Ramesh Garidapuri <Ramesh.Garidapuri@amd.com>
+Change-Id: I5bbba643f6817319c94224a5062de07e97e26b35
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-mdio.c   | 4 +++-
+ drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c | 1 +
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index 51dcbe809..ef2437f80 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@ -1301,7 +1301,9 @@ static int __xgbe_phy_config_aneg(struct xgbe_prv_data *pdata, bool set_mode)
+ 			/* Force the modset in AN case to see if
+ 			 * that can help in reducing ANLT failures
+ 			 */
+-			xgbe_change_mode(pdata, XGBE_MODE_KR);
++			pdata->vdata->an_kr_workaround ?
++			xgbe_change_mode(pdata, XGBE_MODE_KR) :
++			xgbe_set_mode(pdata, XGBE_MODE_KR);
+ 		} else if (xgbe_use_mode(pdata, XGBE_MODE_KX_2500)) {
+ 			xgbe_set_mode(pdata, XGBE_MODE_KX_2500);
+ 		} else if (xgbe_use_mode(pdata, XGBE_MODE_KX_1000)) {
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 57c372017..dea5d9f51 100755
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@ -4313,6 +4313,7 @@ static int xgbe_phy_init(struct xgbe_prv_data *pdata)
+ 		}
+ 
+ 		phy_data->phydev_mode = XGBE_MDIO_MODE_CL45;
++		pdata->vdata->an_kr_workaround = 0;
+ 		break;
+ 
+ 	/* 10GBase-R support */
+-- 
+2.34.1
+

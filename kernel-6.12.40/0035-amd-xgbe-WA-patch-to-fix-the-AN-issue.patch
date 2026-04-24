@@ -1,0 +1,63 @@
+From 62f7ad28ba5bb103b48fe94ad58ad039b7ee10d5 Mon Sep 17 00:00:00 2001
+From: Kalyan Rankireddy <Kalyan.Rankireddy@amd.com>
+Date: Mon, 15 Jul 2024 17:26:28 +0530
+Subject: [PATCH 035/127] amd-xgbe: WA patch to fix the AN issue
+
+AQR phy fails in doing AN when repeated phy_start_aneg() is
+called when AN is in progress.
+fixes: EMBDEV-18969
+
+Signed-off-by: Kalyan Rankireddy <Kalyan.Rankireddy@amd.com>
+Change-Id: Iacf1cbf5406b425a4b22933ecc0c1b7f4156114d
+Signed-off-by: amlakshm <AmmuThivya.LakshmiS@amd.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c | 13 ++++++++++++-
+ drivers/net/ethernet/amd/xgbe/xgbe.h        |  1 +
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 5a6592736..94988c81c 100755
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@ -2139,6 +2139,7 @@ static int xgbe_phy_an_config(struct xgbe_prv_data *pdata)
+ 	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
+ 	struct xgbe_phy_data *phy_data = pdata->phy_data;
+ 	int ret;
++	unsigned long link_timeout;
+ 
+ 	ret = xgbe_phy_find_phy_device(pdata);
+ 	if (ret)
+@@ -2165,7 +2166,17 @@ static int xgbe_phy_an_config(struct xgbe_prv_data *pdata)
+ 		return 0;
+ 	}
+ 
+-	ret = phy_start_aneg(phy_data->phydev);
++	netif_dbg(pdata, link, pdata->netdev, " phy_start_aneg pdata->an_mode:%d phydev_mode:%d\n",
++							pdata->an_mode, phy_data->phydev_mode);
++	if (pdata->an_mode == XGBE_AN_MODE_MDIO){
++		link_timeout = pdata->phy_link_check + (XGBE_LINK_TIMEOUT*2 * HZ);
++		if (time_after(jiffies, link_timeout)) {
++			ret = phy_start_aneg(phy_data->phydev);
++			pdata->phy_link_check = jiffies;
++		} else
++			netif_dbg(pdata, link, pdata->netdev, "  phy_start_aneg  not called\n");
++	}else
++		ret = phy_start_aneg(phy_data->phydev);
+ 
+ 
+ 	return ret;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 851c66959..eb674e191 100755
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -1312,6 +1312,7 @@ struct xgbe_prv_data {
+ 	struct xgbe_phy phy;
+ 	int mdio_mmd;
+ 	unsigned long link_check;
++	unsigned long phy_link_check;
+ 	struct completion mdio_complete;
+ 	unsigned int ext_fixed_phy;
+ 
+-- 
+2.34.1
+

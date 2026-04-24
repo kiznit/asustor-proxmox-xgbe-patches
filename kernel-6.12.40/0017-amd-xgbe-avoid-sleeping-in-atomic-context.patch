@@ -1,0 +1,152 @@
+From c109a8acc79b4be620a21a18a964082636520688 Mon Sep 17 00:00:00 2001
+From: Raju Rangoju <Raju.Rangoju@amd.com>
+Date: Mon, 5 Feb 2024 19:45:00 +0530
+Subject: [PATCH 017/127] amd-xgbe: avoid sleeping in atomic context
+
+Smatch static checker throws a warning from xgbe_powerdown()
+"warn: sleeping in atomic context".
+
+Fix the warning by using appropriate locks and reorganizing the
+power down sequence flow.
+
+Fixes: c5aa9e3b8156 ("amd-xgbe: Initial AMD 10GbE platform driver")
+Signed-off-by: Raju Rangoju <Raju.Rangoju@amd.com>
+Change-Id: I9cace75436872c3b3ae8f0bfc2733b7abe06abb5
+Signed-off-by: amlakshm <AmmuThivya.LakshmiS@amd.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-drv.c | 71 ++++++++++++++++--------
+ 1 file changed, 49 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 44131c361..df9fdf3a2 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -124,6 +124,7 @@
+ #include <linux/net_tstamp.h>
+ #include <linux/phy.h>
+ #include <net/vxlan.h>
++#include <linux/pci.h>
+ 
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+@@ -1179,23 +1180,18 @@ static int xgbe_phy_reset(struct xgbe_prv_data *pdata)
+ 	return pdata->phy_if.phy_reset(pdata);
+ }
+ 
+-int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
++static int xgbe_suspend(struct net_device *netdev, unsigned int caller)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+-	unsigned long flags;
+-
+-	DBGPR("-->xgbe_powerdown\n");
+ 
+ 	if (!netif_running(netdev) ||
+ 	    (caller == XGMAC_IOCTL_CONTEXT && pdata->power_down)) {
+-		netdev_alert(netdev, "Device is already powered down\n");
+-		DBGPR("<--xgbe_powerdown\n");
++		netdev_alert(netdev, "Device is already suspended\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	spin_lock_irqsave(&pdata->lock, flags);
+-
++	rtnl_lock();
+ 	if (caller == XGMAC_DRIVER_CONTEXT)
+ 		netif_device_detach(netdev);
+ 
+@@ -1206,33 +1202,40 @@ int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
+ 
+ 	hw_if->powerdown_tx(pdata);
+ 	hw_if->powerdown_rx(pdata);
++	rtnl_unlock();
+ 
+ 	xgbe_napi_disable(pdata, 0);
+ 
+ 	pdata->power_down = 1;
+ 
+-	spin_unlock_irqrestore(&pdata->lock, flags);
++	return 0;
++}
++
++int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct pci_dev *pdev = pdata->pcidev;
++
++	int ret = xgbe_suspend(netdev, caller);
++
++	if (ret)
++		return ret;
++	ret = pci_save_state(pdev);
++	if (ret)
++		return ret;
+ 
+-	DBGPR("<--xgbe_powerdown\n");
++	pci_disable_device(pdev);
++	pci_wake_from_d3(pdev, true);
+ 
+ 	return 0;
+ }
+ 
+-int xgbe_powerup(struct net_device *netdev, unsigned int caller)
++static int xgbe_resume(struct net_device *netdev, unsigned int caller)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ 	unsigned long flags;
+ 
+-	DBGPR("-->xgbe_powerup\n");
+-
+-	if (!netif_running(netdev) ||
+-	    (caller == XGMAC_IOCTL_CONTEXT && !pdata->power_down)) {
+-		netdev_alert(netdev, "Device is already powered up\n");
+-		DBGPR("<--xgbe_powerup\n");
+-		return -EINVAL;
+-	}
+-
+ 	spin_lock_irqsave(&pdata->lock, flags);
+ 
+ 	pdata->power_down = 0;
+@@ -1251,11 +1254,35 @@ int xgbe_powerup(struct net_device *netdev, unsigned int caller)
+ 
+ 	spin_unlock_irqrestore(&pdata->lock, flags);
+ 
+-	DBGPR("<--xgbe_powerup\n");
+-
+ 	return 0;
+ }
+ 
++int xgbe_powerup(struct net_device *netdev, unsigned int caller)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct pci_dev *pdev = pdata->pcidev;
++	int ret;
++
++	if (!netif_running(netdev) ||
++	    (caller == XGMAC_IOCTL_CONTEXT && !pdata->power_down)) {
++		netdev_alert(netdev, "Device is already resumed\n");
++		return -EINVAL;
++	}
++
++	pci_restore_state(pdev);
++	pci_set_power_state(pdev, PCI_D0);
++
++	ret = pci_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	pci_set_master(pdev);
++
++	ret = xgbe_resume(netdev, caller);
++
++	return ret;
++}
++
+ static void xgbe_free_memory(struct xgbe_prv_data *pdata)
+ {
+ 	struct xgbe_desc_if *desc_if = &pdata->desc_if;
+-- 
+2.34.1
+

@@ -1,0 +1,75 @@
+From 157b37d1b089ecf19a531c295bcc235347f94af0 Mon Sep 17 00:00:00 2001
+From: Raju Rangoju <Raju.Rangoju@amd.com>
+Date: Thu, 7 Nov 2024 16:02:49 +0530
+Subject: [PATCH 031/127] amd-xgbe: add missing tx and rx ethtool error
+ counters
+
+Signed-off-by: Raju Rangoju <Raju.Rangoju@amd.com>
+Change-Id: I530ed6a9099a4225766c328ce6cc5b22d3ca8414
+Signed-off-by: amlakshm <AmmuThivya.LakshmiS@amd.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c | 12 ++++++++++++
+ drivers/net/ethernet/amd/xgbe/xgbe.h         |  4 ++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index 5fc94c2f6..81cb958d1 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -156,6 +156,8 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("tx_1024_to_max_byte_packets", tx1024tomaxoctets_gb),
+ 	XGMAC_MMC_STAT("tx_underflow_errors", txunderflowerror),
+ 	XGMAC_MMC_STAT("tx_pause_frames", txpauseframes),
++	XGMAC_MMC_STAT("tx_errors", tx_errors),
++	XGMAC_MMC_STAT("tx_dropped", tx_dropped),
+ 
+ 	XGMAC_MMC_STAT("rx_bytes", rxoctetcount_gb),
+ 	XGMAC_MMC_STAT("rx_packets", rxframecount_gb),
+@@ -184,6 +186,8 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("rx_pause_frames", rxpauseframes),
+ 	XGMAC_EXT_STAT("rx_split_header_packets", rx_split_header_packets),
+ 	XGMAC_EXT_STAT("rx_buffer_unavailable", rx_buffer_unavailable),
++	XGMAC_MMC_STAT("rx_errors", rx_errors),
++	XGMAC_MMC_STAT("rx_dropped", rx_dropped),
+ };
+ 
+ #define XGBE_STATS_COUNT	ARRAY_SIZE(xgbe_gstring_stats)
+@@ -220,10 +224,18 @@ static void xgbe_get_ethtool_stats(struct net_device *netdev,
+ 				   struct ethtool_stats *stats, u64 *data)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct xgbe_mmc_stats *pstats = &pdata->mmc_stats;
+ 	u8 *stat;
+ 	int i;
+ 
+ 	pdata->hw_if.read_mmc_stats(pdata);
++	pstats->tx_errors = pstats->txframecount_gb - pstats->txframecount_g;
++	pstats->tx_dropped = netdev->stats.tx_dropped;
++	pstats->rx_errors = pstats->rxframecount_gb -
++			   pstats->rxbroadcastframes_g -
++			   pstats->rxmulticastframes_g -
++			   pstats->rxunicastframes_g;
++	pstats->rx_dropped = netdev->stats.rx_dropped;
+ 	for (i = 0; i < XGBE_STATS_COUNT; i++) {
+ 		stat = (u8 *)pdata + xgbe_gstring_stats[i].stat_offset;
+ 		*data++ = *(u64 *)stat;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index e420d648f..92b61a318 100755
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -734,8 +734,12 @@ struct xgbe_mmc_stats {
+ 	u64 txframecount_g;
+ 	u64 txpauseframes;
+ 	u64 txvlanframes_g;
++	u64 tx_errors;
++	u64 tx_dropped;
+ 
+ 	/* Rx Stats */
++	u64 rx_errors;
++	u64 rx_dropped;
+ 	u64 rxframecount_gb;
+ 	u64 rxoctetcount_gb;
+ 	u64 rxoctetcount_g;
+-- 
+2.34.1
+

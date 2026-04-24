@@ -1,0 +1,322 @@
+From 136b50fa4415ffa4f36b49f6ad337321c7a2a3b6 Mon Sep 17 00:00:00 2001
+From: rgaridap <ramesh.garidapuri@amd.com>
+Date: Wed, 13 Aug 2025 23:13:27 +0000
+Subject: [PATCH 014/127] amd-xgbe: extend driver functionality to support
+ 10GbaseT
+
+The current XGBE driver supports 10GBaseT using 10GBaseKR (with
+CL73/CL72 AN). However, most PHYs support only 10GBaseR and do not
+support 10GBaseKR. Hence, extend the amd-xgbe driver functionality to
+support 10GBaseT using 10GBaseR interface. This implementation uses MDIO
+sideband interface depending on PHY capability.
+
+Signed-off-by: Raju Rangoju <Raju.Rangoju@amd.com>
+Change-Id: Ic3cc7c384d0540e100937a310abc2019488a48d6
+Signed-off-by: amlakshm <AmmuThivya.LakshmiS@amd.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-mdio.c   |   6 +
+ drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c | 161 +++++++++++++++++---
+ drivers/net/ethernet/amd/xgbe/xgbe.h        |   1 +
+ 3 files changed, 149 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index ed76a8df6..19b4f4c03 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@ -1322,6 +1322,7 @@ static void xgbe_check_link_timeout(struct xgbe_prv_data *pdata)
+ 	link_timeout = pdata->link_check + (XGBE_LINK_TIMEOUT * HZ);
+ 	if (time_after(jiffies, link_timeout)) {
+ 		if ((xgbe_cur_mode(pdata) == XGBE_MODE_KR) &&
++		    (pdata->an_mode != XGBE_AN_MODE_MDIO) &&
+ 		    pdata->phy.autoneg == AUTONEG_ENABLE) {
+ 			/* AN restart should not happen while KR training is in progress.
+ 			 * The while loop ensures no AN restart during KR training,
+@@ -1362,6 +1363,10 @@ static bool xgbe_phy_status_result(struct xgbe_prv_data *pdata)
+ 	else
+ 		mode = xgbe_phy_status_aneg(pdata);
+ 
++	/* speed setting isn't needed for MDIO mode as it is taken care at a later point */
++	if (pdata->an_mode == XGBE_AN_MODE_MDIO)
++		goto skip_speed_set;
++
+ 	switch (mode) {
+ 	case XGBE_MODE_SGMII_10:
+ 		pdata->phy.speed = SPEED_10;
+@@ -1386,6 +1391,7 @@ static bool xgbe_phy_status_result(struct xgbe_prv_data *pdata)
+ 		pdata->phy.speed = SPEED_UNKNOWN;
+ 	}
+ 
++skip_speed_set:
+ 	pdata->phy.duplex = DUPLEX_FULL;
+ 
+ 	if (!xgbe_set_mode(pdata, mode))
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 32e633d11..81eddf682 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@ -382,6 +382,9 @@ struct xgbe_phy_data {
+ 	/* KR AN support */
+ 	unsigned int phy_cdr_notrack;
+ 	unsigned int phy_cdr_delay;
++
++	/* AN support via MDIO sideband */
++	bool mdio_an_mode;
+ };
+ 
+ /* I2C, MDIO and GPIO lines are muxed, so only one device at a time */
+@@ -1760,15 +1763,11 @@ static enum xgbe_mode xgbe_phy_an73_redrv_outcome(struct xgbe_prv_data *pdata)
+ 	return mode;
+ }
+ 
+-static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
++static void  xgbe_phy_get_an_outcome(struct xgbe_prv_data *pdata,
++				     struct ethtool_link_ksettings *lks)
+ {
+-	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
+-	enum xgbe_mode mode;
+ 	unsigned int ad_reg, lp_reg;
+ 
+-	XGBE_SET_LP_ADV(lks, Autoneg);
+-	XGBE_SET_LP_ADV(lks, Backplane);
+-
+ 	/* Compare Advertisement and Link Partner register 1 */
+ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
+ 	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA);
+@@ -1792,6 +1791,18 @@ static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
+ 				pdata->phy.tx_pause = 1;
+ 		}
+ 	}
++}
++
++static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
++{
++	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
++	unsigned int ad_reg, lp_reg;
++	enum xgbe_mode mode;
++
++	XGBE_SET_LP_ADV(lks, Autoneg);
++	XGBE_SET_LP_ADV(lks, Backplane);
++
++	xgbe_phy_get_an_outcome(pdata, lks);
+ 
+ 	/* Compare Advertisement and Link Partner register 2 */
+ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1);
+@@ -1818,6 +1829,79 @@ static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
+ 	return mode;
+ }
+ 
++static enum xgbe_mode xgbe_phy_mdio_an_outcome(struct xgbe_prv_data *pdata)
++{
++	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++	enum xgbe_mode mode;
++	int speed;
++
++	if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T) {
++		if (!phy_aneg_done(phy_data->phydev)) {
++			pdata->en_rx_adap = 0;
++			phy_data->mdio_an_mode = true;
++			return phy_data->cur_mode;
++		}
++	} else {
++		phy_data->mdio_an_mode = false;
++		return phy_data->cur_mode;
++	}
++
++	if (phy_data->phydev)
++		xgbe_phy_get_an_outcome(pdata, lks);
++
++	phy_data->phydev->interface == PHY_INTERFACE_MODE_10GKR ?
++					(phy_data->mdio_an_mode = false) :
++					(phy_data->mdio_an_mode = true);
++
++	switch (phy_data->phydev->interface) {
++	case PHY_INTERFACE_MODE_10GKR:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_KR;
++		break;
++	case PHY_INTERFACE_MODE_10GBASER:
++		mode = XGBE_MODE_KR;
++		break;
++	case PHY_INTERFACE_MODE_SGMII:
++		pdata->en_rx_adap = 0;
++		if (phy_data->phydev->speed == SPEED_10) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_10)
++				mode = XGBE_MODE_SGMII_10;
++		} else if (phy_data->phydev->speed == SPEED_100) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_100)
++				mode = XGBE_MODE_SGMII_100;
++		} else if (phy_data->phydev->speed == SPEED_1000) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_1000)
++				mode = XGBE_MODE_SGMII_1000;
++		} else if (phy_data->phydev->speed == SPEED_2500) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_2500)
++				mode = XGBE_MODE_KX_2500;
++		} else {
++			mode = XGBE_MODE_SGMII_1000;
++		}
++		break;
++	case PHY_INTERFACE_MODE_2500BASEX:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_KX_2500;
++		break;
++	default:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_SGMII_1000;
++		goto err;
++	}
++
++	pdata->phy.speed  = phy_data->phydev->speed;
++	if (mode != phy_data->cur_mode) {
++		if (mode == XGBE_MODE_KR || mode == XGBE_MODE_SFI)
++			speed = SPEED_10000;
++		else
++			speed = pdata->phy.speed;
++		pdata->hw_if.set_speed(pdata, speed);
++	}
++err:
++	return mode;
++}
++
+ static enum xgbe_mode xgbe_phy_an_outcome(struct xgbe_prv_data *pdata)
+ {
+ 	switch (pdata->an_mode) {
+@@ -1829,6 +1913,8 @@ static enum xgbe_mode xgbe_phy_an_outcome(struct xgbe_prv_data *pdata)
+ 		return xgbe_phy_an37_outcome(pdata);
+ 	case XGBE_AN_MODE_CL37_SGMII:
+ 		return xgbe_phy_an37_sgmii_outcome(pdata);
++	case XGBE_AN_MODE_MDIO:
++		return xgbe_phy_mdio_an_outcome(pdata);
+ 	default:
+ 		return XGBE_MODE_UNKNOWN;
+ 	}
+@@ -1962,7 +2048,10 @@ static enum xgbe_an_mode xgbe_phy_an_mode(struct xgbe_prv_data *pdata)
+ 	case XGBE_PORT_MODE_NBASE_T:
+ 		return XGBE_AN_MODE_CL37_SGMII;
+ 	case XGBE_PORT_MODE_10GBASE_T:
+-		return XGBE_AN_MODE_CL73;
++		if (phy_data->mdio_an_mode)
++			return XGBE_AN_MODE_MDIO;
++		else
++			return XGBE_AN_MODE_CL73;
+ 	case XGBE_PORT_MODE_10GBASE_R:
+ 		return XGBE_AN_MODE_NONE;
+ 	case XGBE_PORT_MODE_SFP:
+@@ -2137,8 +2226,11 @@ static void xgbe_phy_rx_reset(struct xgbe_prv_data *pdata)
+ 
+ static void xgbe_phy_pll_ctrl(struct xgbe_prv_data *pdata, bool enable)
+ {
+-	/* PLL_CTRL feature needs to be enabled for fixed PHY modes (Non-Autoneg) only */
+-	if (pdata->phy.autoneg != AUTONEG_DISABLE)
++	/* PLL_CTRL feature needs to be enabled for
++	 * fixed PHY modes (Non-Autoneg) and mdio mode only
++	 */
++	if (pdata->phy.autoneg != AUTONEG_DISABLE &&
++	    pdata->an_mode != XGBE_AN_MODE_MDIO)
+ 		return;
+ 
+ 	XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_VEND2_PMA_MISC_CTRL0,
+@@ -2249,7 +2341,8 @@ static bool enable_rx_adap(struct xgbe_prv_data *pdata, enum xgbe_mode mode)
+ 
+ 	/* 10G KR mode with AN does not support Rx-Adaptation */
+ 	if (mode == XGBE_MODE_KR &&
+-	    phy_data->port_mode != XGBE_PORT_MODE_BACKPLANE_NO_AUTONEG)
++	    (!phy_data->mdio_an_mode &&
++	    phy_data->port_mode != XGBE_PORT_MODE_BACKPLANE_NO_AUTONEG))
+ 		return false;
+ 
+ 	pdata->en_rx_adap = 1;
+@@ -2594,6 +2687,11 @@ static void xgbe_phy_set_mode(struct xgbe_prv_data *pdata, enum xgbe_mode mode)
+ static bool xgbe_phy_check_mode(struct xgbe_prv_data *pdata,
+ 				enum xgbe_mode mode, bool advert)
+ {
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	if (phy_data->mdio_an_mode)
++		return (mode == xgbe_phy_mdio_an_outcome(pdata)) ? true : false;
++
+ 	if (pdata->phy.autoneg == AUTONEG_ENABLE) {
+ 		return advert;
+ 	} else {
+@@ -2868,25 +2966,48 @@ static int xgbe_phy_link_status(struct xgbe_prv_data *pdata, int *an_restart)
+ 			return 0;
+ 		}
+ 
+-		if (phy_data->sfp_mod_absent || phy_data->sfp_rx_los) {
+-			if (pdata->en_rx_adap)
+-				pdata->rx_adapt_done = false;
+-			return 0;
+-		}
++		if (phy_data->sfp_mod_absent || phy_data->sfp_rx_los)
++			goto out;
+ 	}
+ 
+ 	if (phy_data->phydev) {
+ 		/* Check external PHY */
+ 		ret = phy_read_status(phy_data->phydev);
+ 		if (ret < 0)
+-			return 0;
++			goto out;
+ 
+ 		if ((pdata->phy.autoneg == AUTONEG_ENABLE) &&
+-		    !phy_aneg_done(phy_data->phydev))
+-			return 0;
++		    !phy_aneg_done(phy_data->phydev)) {
++			if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T &&
++			    pdata->phy_speed != SPEED_UNKNOWN) {
++				pdata->phy_speed = SPEED_UNKNOWN;
++				netif_carrier_off(pdata->netdev);
++			}
++			goto out;
++		}
+ 
+ 		if (!phy_data->phydev->link)
+-			return 0;
++			goto out;
++	}
++
++	if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T) {
++		enum xgbe_mode mode;
++
++		mode  = xgbe_phy_mdio_an_outcome(pdata);
++		if (mode != xgbe_phy_cur_mode(pdata)) {
++			netif_dbg(pdata, link, pdata->netdev,
++				  "Ext PHY changed interface mode to %d so AN is needed\n", mode);
++			*an_restart = 1;
++			goto out;
++		}
++
++		if (pdata->an_mode == XGBE_AN_MODE_MDIO)
++			pdata->an_result = XGBE_AN_COMPLETE;
++
++		if (enable_rx_adap(pdata, mode) && !pdata->rx_adapt_done) {
++			xgbe_phy_rx_adaptation(pdata);
++			msleep(200);
++		}
+ 	}
+ 
+ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1);
+@@ -2940,6 +3061,8 @@ static int xgbe_phy_link_status(struct xgbe_prv_data *pdata, int *an_restart)
+ 		xgbe_phy_rrc(pdata);
+ 	}
+ 
++out:
++	pdata->rx_adapt_done = false;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 7526a0906..26501f474 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -572,6 +572,7 @@ enum xgbe_an_mode {
+ 	XGBE_AN_MODE_CL73_REDRV,
+ 	XGBE_AN_MODE_CL37,
+ 	XGBE_AN_MODE_CL37_SGMII,
++	XGBE_AN_MODE_MDIO,
+ 	XGBE_AN_MODE_NONE,
+ };
+ 
+-- 
+2.34.1
+

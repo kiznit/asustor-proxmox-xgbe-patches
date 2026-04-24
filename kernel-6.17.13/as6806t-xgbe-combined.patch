@@ -1,0 +1,904 @@
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 009fbc9b11ce..f50ee9aaa218 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -1195,6 +1195,14 @@
+ #define MDIO_PMA_10GBR_FECCTRL		0x00ab
+ #endif
+ 
++#ifndef MDIO_PMA_RX_EQ_CTRL
++#define MDIO_PMA_RX_EQ_CTRL		0x8009
++#endif
++
++#ifndef MDIO_PMA_RX_CTRL0
++#define MDIO_PMA_RX_CTRL0		0x8050
++#endif
++
+ #ifndef MDIO_PMA_RX_CTRL1
+ #define MDIO_PMA_RX_CTRL1		0x8051
+ #endif
+@@ -1353,6 +1361,14 @@
+ #define XGBE_PMA_PLL_CTRL_ENABLE	BIT(15)
+ #define XGBE_PMA_PLL_CTRL_DISABLE	0x0000
+ 
++#define XGBE_PMA_RX_EQ_MGMT_MODE_MASK	BIT(15)
++#define XGBE_PMA_RX_EQ_MGMT_MODE_ON	BIT(15)
++#define XGBE_PMA_RX_EQ_MGMT_MODE_OFF	0x0
++
++#define XGBE_PMA_RX_DT_EN_0_MASK	BIT(8)
++#define XGBE_PMA_RX_DT_EN_0_ON		0x0100
++#define XGBE_PMA_RX_DT_EN_0_OFF		0x0000
++
+ /* Bit setting and getting macros
+  *  The get macro will extract the current bit field value from within
+  *  the variable
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 2ad672c17eec..19691da4b7e2 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -15,6 +15,7 @@
+ #include <linux/net_tstamp.h>
+ #include <linux/phy.h>
+ #include <net/vxlan.h>
++#include <linux/pci.h>
+ 
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+@@ -1070,23 +1071,18 @@ static int xgbe_phy_reset(struct xgbe_prv_data *pdata)
+ 	return pdata->phy_if.phy_reset(pdata);
+ }
+ 
+-int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
++static int xgbe_suspend(struct net_device *netdev, unsigned int caller)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+-	unsigned long flags;
+-
+-	DBGPR("-->xgbe_powerdown\n");
+ 
+ 	if (!netif_running(netdev) ||
+ 	    (caller == XGMAC_IOCTL_CONTEXT && pdata->power_down)) {
+-		netdev_alert(netdev, "Device is already powered down\n");
+-		DBGPR("<--xgbe_powerdown\n");
++		netdev_alert(netdev, "Device is already suspended\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	spin_lock_irqsave(&pdata->lock, flags);
+-
++	rtnl_lock();
+ 	if (caller == XGMAC_DRIVER_CONTEXT)
+ 		netif_device_detach(netdev);
+ 
+@@ -1097,33 +1093,40 @@ int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
+ 
+ 	hw_if->powerdown_tx(pdata);
+ 	hw_if->powerdown_rx(pdata);
++	rtnl_unlock();
+ 
+ 	xgbe_napi_disable(pdata, 0);
+ 
+ 	pdata->power_down = 1;
+ 
+-	spin_unlock_irqrestore(&pdata->lock, flags);
++	return 0;
++}
++
++int xgbe_powerdown(struct net_device *netdev, unsigned int caller)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct pci_dev *pdev = pdata->pcidev;
++
++	int ret = xgbe_suspend(netdev, caller);
++
++	if (ret)
++		return ret;
++	ret = pci_save_state(pdev);
++	if (ret)
++		return ret;
+ 
+-	DBGPR("<--xgbe_powerdown\n");
++	pci_disable_device(pdev);
++	pci_wake_from_d3(pdev, true);
+ 
+ 	return 0;
+ }
+ 
+-int xgbe_powerup(struct net_device *netdev, unsigned int caller)
++static int xgbe_resume(struct net_device *netdev, unsigned int caller)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ 	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ 	unsigned long flags;
+ 
+-	DBGPR("-->xgbe_powerup\n");
+-
+-	if (!netif_running(netdev) ||
+-	    (caller == XGMAC_IOCTL_CONTEXT && !pdata->power_down)) {
+-		netdev_alert(netdev, "Device is already powered up\n");
+-		DBGPR("<--xgbe_powerup\n");
+-		return -EINVAL;
+-	}
+-
+ 	spin_lock_irqsave(&pdata->lock, flags);
+ 
+ 	pdata->power_down = 0;
+@@ -1142,11 +1145,35 @@ int xgbe_powerup(struct net_device *netdev, unsigned int caller)
+ 
+ 	spin_unlock_irqrestore(&pdata->lock, flags);
+ 
+-	DBGPR("<--xgbe_powerup\n");
+-
+ 	return 0;
+ }
+ 
++int xgbe_powerup(struct net_device *netdev, unsigned int caller)
++{
++	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct pci_dev *pdev = pdata->pcidev;
++	int ret;
++
++	if (!netif_running(netdev) ||
++	    (caller == XGMAC_IOCTL_CONTEXT && !pdata->power_down)) {
++		netdev_alert(netdev, "Device is already resumed\n");
++		return -EINVAL;
++	}
++
++	pci_restore_state(pdev);
++	pci_set_power_state(pdev, PCI_D0);
++
++	ret = pci_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	pci_set_master(pdev);
++
++	ret = xgbe_resume(netdev, caller);
++
++	return ret;
++}
++
+ static void xgbe_free_memory(struct xgbe_prv_data *pdata)
+ {
+ 	struct xgbe_desc_if *desc_if = &pdata->desc_if;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index be0d2c7d08dc..e2e180e2de5d 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -47,6 +47,8 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("tx_1024_to_max_byte_packets", tx1024tomaxoctets_gb),
+ 	XGMAC_MMC_STAT("tx_underflow_errors", txunderflowerror),
+ 	XGMAC_MMC_STAT("tx_pause_frames", txpauseframes),
++	XGMAC_MMC_STAT("tx_errors", tx_errors),
++	XGMAC_MMC_STAT("tx_dropped", tx_dropped),
+ 
+ 	XGMAC_MMC_STAT("rx_bytes", rxoctetcount_gb),
+ 	XGMAC_MMC_STAT("rx_packets", rxframecount_gb),
+@@ -75,6 +77,8 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("rx_pause_frames", rxpauseframes),
+ 	XGMAC_EXT_STAT("rx_split_header_packets", rx_split_header_packets),
+ 	XGMAC_EXT_STAT("rx_buffer_unavailable", rx_buffer_unavailable),
++	XGMAC_MMC_STAT("rx_errors", rx_errors),
++	XGMAC_MMC_STAT("rx_dropped", rx_dropped),
+ };
+ 
+ #define XGBE_STATS_COUNT	ARRAY_SIZE(xgbe_gstring_stats)
+@@ -107,10 +111,18 @@ static void xgbe_get_ethtool_stats(struct net_device *netdev,
+ 				   struct ethtool_stats *stats, u64 *data)
+ {
+ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++	struct xgbe_mmc_stats *pstats = &pdata->mmc_stats;
+ 	u8 *stat;
+ 	int i;
+ 
+ 	pdata->hw_if.read_mmc_stats(pdata);
++	pstats->tx_errors = pstats->txframecount_gb - pstats->txframecount_g;
++	pstats->tx_dropped = netdev->stats.tx_dropped;
++	pstats->rx_errors = pstats->rxframecount_gb -
++			   pstats->rxbroadcastframes_g -
++			   pstats->rxmulticastframes_g -
++			   pstats->rxunicastframes_g;
++	pstats->rx_dropped = netdev->stats.rx_dropped;
+ 	for (i = 0; i < XGBE_STATS_COUNT; i++) {
+ 		stat = (u8 *)pdata + xgbe_gstring_stats[i].stat_offset;
+ 		*data++ = *(u64 *)stat;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index 7675bb98f029..9cd410205147 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@ -309,12 +309,16 @@ static void xgbe_an73_set(struct xgbe_prv_data *pdata, bool enable,
+ 		reg |= MDIO_AN_CTRL1_RESTART;
+ 
+ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_CTRL1, reg);
++
+ }
+ 
+ static void xgbe_an73_restart(struct xgbe_prv_data *pdata)
+ {
+-	xgbe_an73_enable_interrupts(pdata);
+-	xgbe_an73_set(pdata, true, true);
++	/* When an_kr_workaround is enabled, AN is already done for KR mode */
++	if (!pdata->vdata->an_kr_workaround || !xgbe_in_kr_mode(pdata)) {
++		xgbe_an73_enable_interrupts(pdata);
++		xgbe_an73_set(pdata, true, true);
++	}
+ 
+ 	netif_dbg(pdata, link, pdata->netdev, "CL73 AN enabled/restarted\n");
+ }
+@@ -490,6 +494,9 @@ static enum xgbe_an xgbe_an73_page_received(struct xgbe_prv_data *pdata)
+ 
+ 			netif_dbg(pdata, link, pdata->netdev,
+ 				  "CL73 AN timed out, resetting state\n");
++
++			if (pdata->phy_if.phy_impl.update_cdr_delay)
++				pdata->phy_if.phy_impl.update_cdr_delay(pdata);
+ 		}
+ 	}
+ 
+@@ -1213,6 +1220,7 @@ static void xgbe_check_link_timeout(struct xgbe_prv_data *pdata)
+ 	link_timeout = pdata->link_check + (XGBE_LINK_TIMEOUT * HZ);
+ 	if (time_after(jiffies, link_timeout)) {
+ 		if ((xgbe_cur_mode(pdata) == XGBE_MODE_KR) &&
++		    (pdata->an_mode != XGBE_AN_MODE_MDIO) &&
+ 		    pdata->phy.autoneg == AUTONEG_ENABLE) {
+ 			/* AN restart should not happen while KR training is in progress.
+ 			 * The while loop ensures no AN restart during KR training,
+@@ -1253,6 +1261,10 @@ static bool xgbe_phy_status_result(struct xgbe_prv_data *pdata)
+ 	else
+ 		mode = xgbe_phy_status_aneg(pdata);
+ 
++	/* speed setting isn't needed for MDIO mode as it is taken care at a later point */
++	if (pdata->an_mode == XGBE_AN_MODE_MDIO)
++		goto skip_speed_set;
++
+ 	switch (mode) {
+ 	case XGBE_MODE_SGMII_10:
+ 		pdata->phy.speed = SPEED_10;
+@@ -1277,6 +1289,7 @@ static bool xgbe_phy_status_result(struct xgbe_prv_data *pdata)
+ 		pdata->phy.speed = SPEED_UNKNOWN;
+ 	}
+ 
++skip_speed_set:
+ 	pdata->phy.duplex = DUPLEX_FULL;
+ 
+ 	if (!xgbe_set_mode(pdata, mode))
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-pci.c b/drivers/net/ethernet/amd/xgbe/xgbe-pci.c
+index e3e1dca9856a..f97aaabae779 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-pci.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-pci.c
+@@ -177,7 +177,8 @@ static int xgbe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			pdata->xpcs_window_sel_reg = PCS_V2_YC_WINDOW_SELECT;
+ 
+ 			/* Yellow Carp devices do not need cdr workaround */
+-			pdata->vdata->an_cdr_workaround = 0;
++			pdata->vdata->an_cdr_workaround = 1;
++			pdata->vdata->an_kr_workaround = 2;
+ 
+ 			/* Yellow Carp devices do not need rrc */
+ 			pdata->vdata->enable_rrc = 0;
+@@ -405,6 +406,7 @@ static struct xgbe_version_data xgbe_v3 = {
+ 	.rx_desc_prefetch		= 5,
+ 	.an_cdr_workaround		= 0,
+ 	.enable_rrc			= 0,
++	.an_kr_workaround		= 1,
+ };
+ 
+ static struct xgbe_version_data xgbe_v2a = {
+@@ -422,6 +424,7 @@ static struct xgbe_version_data xgbe_v2a = {
+ 	.rx_desc_prefetch		= 5,
+ 	.an_cdr_workaround		= 1,
+ 	.enable_rrc			= 1,
++	.an_kr_workaround		= 1,
+ };
+ 
+ static struct xgbe_version_data xgbe_v2b = {
+@@ -439,6 +442,7 @@ static struct xgbe_version_data xgbe_v2b = {
+ 	.rx_desc_prefetch		= 5,
+ 	.an_cdr_workaround		= 1,
+ 	.enable_rrc			= 1,
++	.an_kr_workaround		= 1,
+ };
+ 
+ static const struct pci_device_id xgbe_pci_table[] = {
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+index 57f45e7cafeb..06e85aeaab20 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-phy-v2.c
+@@ -41,9 +41,9 @@
+ #define XGBE_RATECHANGE_COUNT		500
+ 
+ /* CDR delay values for KR support (in usec) */
+-#define XGBE_CDR_DELAY_INIT		10000
+-#define XGBE_CDR_DELAY_INC		10000
+-#define XGBE_CDR_DELAY_MAX		100000
++#define XGBE_CDR_DELAY_INIT		22000
++#define XGBE_CDR_DELAY_INC		22000
++#define XGBE_CDR_DELAY_MAX		110000
+ 
+ /* RRC frequency during link status check */
+ #define XGBE_RRC_FREQUENCY		10
+@@ -273,6 +273,9 @@ struct xgbe_phy_data {
+ 	/* KR AN support */
+ 	unsigned int phy_cdr_notrack;
+ 	unsigned int phy_cdr_delay;
++
++	/* AN support via MDIO sideband */
++	bool mdio_an_mode;
+ };
+ 
+ /* I2C, MDIO and GPIO lines are muxed, so only one device at a time */
+@@ -1651,15 +1654,11 @@ static enum xgbe_mode xgbe_phy_an73_redrv_outcome(struct xgbe_prv_data *pdata)
+ 	return mode;
+ }
+ 
+-static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
++static void  xgbe_phy_get_an_outcome(struct xgbe_prv_data *pdata,
++				     struct ethtool_link_ksettings *lks)
+ {
+-	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
+-	enum xgbe_mode mode;
+ 	unsigned int ad_reg, lp_reg;
+ 
+-	XGBE_SET_LP_ADV(lks, Autoneg);
+-	XGBE_SET_LP_ADV(lks, Backplane);
+-
+ 	/* Compare Advertisement and Link Partner register 1 */
+ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
+ 	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA);
+@@ -1683,6 +1682,18 @@ static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
+ 				pdata->phy.tx_pause = 1;
+ 		}
+ 	}
++}
++
++static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
++{
++	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
++	unsigned int ad_reg, lp_reg;
++	enum xgbe_mode mode;
++
++	XGBE_SET_LP_ADV(lks, Autoneg);
++	XGBE_SET_LP_ADV(lks, Backplane);
++
++	xgbe_phy_get_an_outcome(pdata, lks);
+ 
+ 	/* Compare Advertisement and Link Partner register 2 */
+ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1);
+@@ -1709,6 +1720,79 @@ static enum xgbe_mode xgbe_phy_an73_outcome(struct xgbe_prv_data *pdata)
+ 	return mode;
+ }
+ 
++static enum xgbe_mode xgbe_phy_mdio_an_outcome(struct xgbe_prv_data *pdata)
++{
++	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++	enum xgbe_mode mode;
++	int speed;
++
++	if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T) {
++		if (!phy_aneg_done(phy_data->phydev)) {
++			pdata->en_rx_adap = 0;
++			phy_data->mdio_an_mode = true;
++			return phy_data->cur_mode;
++		}
++	} else {
++		phy_data->mdio_an_mode = false;
++		return phy_data->cur_mode;
++	}
++
++	if (phy_data->phydev)
++		xgbe_phy_get_an_outcome(pdata, lks);
++
++	phy_data->phydev->interface == PHY_INTERFACE_MODE_10GKR ?
++					(phy_data->mdio_an_mode = false) :
++					(phy_data->mdio_an_mode = true);
++
++	switch (phy_data->phydev->interface) {
++	case PHY_INTERFACE_MODE_10GKR:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_KR;
++		break;
++	case PHY_INTERFACE_MODE_10GBASER:
++		mode = XGBE_MODE_KR;
++		break;
++	case PHY_INTERFACE_MODE_SGMII:
++		pdata->en_rx_adap = 0;
++		if (phy_data->phydev->speed == SPEED_10) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_10)
++				mode = XGBE_MODE_SGMII_10;
++		} else if (phy_data->phydev->speed == SPEED_100) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_100)
++				mode = XGBE_MODE_SGMII_100;
++		} else if (phy_data->phydev->speed == SPEED_1000) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_1000)
++				mode = XGBE_MODE_SGMII_1000;
++		} else if (phy_data->phydev->speed == SPEED_2500) {
++			if (phy_data->port_speeds & XGBE_PHY_PORT_SPEED_2500)
++				mode = XGBE_MODE_KX_2500;
++		} else {
++			mode = XGBE_MODE_SGMII_1000;
++		}
++		break;
++	case PHY_INTERFACE_MODE_2500BASEX:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_KX_2500;
++		break;
++	default:
++		pdata->en_rx_adap = 0;
++		mode = XGBE_MODE_SGMII_1000;
++		goto err;
++	}
++
++	pdata->phy.speed  = phy_data->phydev->speed;
++	if (mode != phy_data->cur_mode) {
++		if (mode == XGBE_MODE_KR || mode == XGBE_MODE_SFI)
++			speed = SPEED_10000;
++		else
++			speed = pdata->phy.speed;
++		pdata->hw_if.set_speed(pdata, speed);
++	}
++err:
++	return mode;
++}
++
+ static enum xgbe_mode xgbe_phy_an_outcome(struct xgbe_prv_data *pdata)
+ {
+ 	switch (pdata->an_mode) {
+@@ -1720,6 +1804,8 @@ static enum xgbe_mode xgbe_phy_an_outcome(struct xgbe_prv_data *pdata)
+ 		return xgbe_phy_an37_outcome(pdata);
+ 	case XGBE_AN_MODE_CL37_SGMII:
+ 		return xgbe_phy_an37_sgmii_outcome(pdata);
++	case XGBE_AN_MODE_MDIO:
++		return xgbe_phy_mdio_an_outcome(pdata);
+ 	default:
+ 		return XGBE_MODE_UNKNOWN;
+ 	}
+@@ -1795,6 +1881,7 @@ static int xgbe_phy_an_config(struct xgbe_prv_data *pdata)
+ 	struct ethtool_link_ksettings *lks = &pdata->phy.lks;
+ 	struct xgbe_phy_data *phy_data = pdata->phy_data;
+ 	int ret;
++	unsigned long link_timeout;
+ 
+ 	ret = xgbe_phy_find_phy_device(pdata);
+ 	if (ret)
+@@ -1813,7 +1900,14 @@ static int xgbe_phy_an_config(struct xgbe_prv_data *pdata)
+ 		phy_data->phydev->duplex = pdata->phy.duplex;
+ 	}
+ 
+-	ret = phy_start_aneg(phy_data->phydev);
++	if (pdata->an_mode == XGBE_AN_MODE_MDIO) {
++		link_timeout = pdata->phy_link_check + (XGBE_LINK_TIMEOUT*2 * HZ);
++		if (time_after(jiffies, link_timeout)) {
++			ret = phy_start_aneg(phy_data->phydev);
++			pdata->phy_link_check = jiffies;
++		}
++	} else
++		ret = phy_start_aneg(phy_data->phydev);
+ 
+ 	return ret;
+ }
+@@ -1853,7 +1947,10 @@ static enum xgbe_an_mode xgbe_phy_an_mode(struct xgbe_prv_data *pdata)
+ 	case XGBE_PORT_MODE_NBASE_T:
+ 		return XGBE_AN_MODE_CL37_SGMII;
+ 	case XGBE_PORT_MODE_10GBASE_T:
+-		return XGBE_AN_MODE_CL73;
++		if (phy_data->mdio_an_mode)
++			return XGBE_AN_MODE_MDIO;
++		else
++			return XGBE_AN_MODE_CL73;
+ 	case XGBE_PORT_MODE_10GBASE_R:
+ 		return XGBE_AN_MODE_NONE;
+ 	case XGBE_PORT_MODE_SFP:
+@@ -2030,8 +2127,11 @@ static void xgbe_phy_rx_reset(struct xgbe_prv_data *pdata)
+ 
+ static void xgbe_phy_pll_ctrl(struct xgbe_prv_data *pdata, bool enable)
+ {
+-	/* PLL_CTRL feature needs to be enabled for fixed PHY modes (Non-Autoneg) only */
+-	if (pdata->phy.autoneg != AUTONEG_DISABLE)
++	/* PLL_CTRL feature needs to be enabled for
++	 * fixed PHY modes (Non-Autoneg) and mdio mode only
++	 */
++	if (pdata->phy.autoneg != AUTONEG_DISABLE &&
++	    pdata->an_mode != XGBE_AN_MODE_MDIO)
+ 		return;
+ 
+ 	XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_VEND2_PMA_MISC_CTRL0,
+@@ -2142,7 +2242,8 @@ static bool enable_rx_adap(struct xgbe_prv_data *pdata, enum xgbe_mode mode)
+ 
+ 	/* 10G KR mode with AN does not support Rx-Adaptation */
+ 	if (mode == XGBE_MODE_KR &&
+-	    phy_data->port_mode != XGBE_PORT_MODE_BACKPLANE_NO_AUTONEG)
++	    (!phy_data->mdio_an_mode &&
++	    phy_data->port_mode != XGBE_PORT_MODE_BACKPLANE_NO_AUTONEG))
+ 		return false;
+ 
+ 	pdata->en_rx_adap = 1;
+@@ -2487,6 +2588,11 @@ static void xgbe_phy_set_mode(struct xgbe_prv_data *pdata, enum xgbe_mode mode)
+ static bool xgbe_phy_check_mode(struct xgbe_prv_data *pdata,
+ 				enum xgbe_mode mode, bool advert)
+ {
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	if (phy_data->mdio_an_mode)
++		return (mode == xgbe_phy_mdio_an_outcome(pdata)) ? true : false;
++
+ 	if (pdata->phy.autoneg == AUTONEG_ENABLE) {
+ 		return advert;
+ 	} else {
+@@ -2761,25 +2867,48 @@ static int xgbe_phy_link_status(struct xgbe_prv_data *pdata, int *an_restart)
+ 			return 0;
+ 		}
+ 
+-		if (phy_data->sfp_mod_absent || phy_data->sfp_rx_los) {
+-			if (pdata->en_rx_adap)
+-				pdata->rx_adapt_done = false;
+-			return 0;
+-		}
++		if (phy_data->sfp_mod_absent || phy_data->sfp_rx_los)
++			goto out;
+ 	}
+ 
+ 	if (phy_data->phydev) {
+ 		/* Check external PHY */
+ 		ret = phy_read_status(phy_data->phydev);
+ 		if (ret < 0)
+-			return 0;
++			goto out;
+ 
+ 		if ((pdata->phy.autoneg == AUTONEG_ENABLE) &&
+-		    !phy_aneg_done(phy_data->phydev))
+-			return 0;
++		    !phy_aneg_done(phy_data->phydev)) {
++			if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T &&
++			    pdata->phy_speed != SPEED_UNKNOWN) {
++				pdata->phy_speed = SPEED_UNKNOWN;
++				netif_carrier_off(pdata->netdev);
++			}
++			goto out;
++		}
+ 
+ 		if (!phy_data->phydev->link)
+-			return 0;
++			goto out;
++	}
++
++	if (phy_data->port_mode == XGBE_PORT_MODE_10GBASE_T) {
++		enum xgbe_mode mode;
++
++		mode  = xgbe_phy_mdio_an_outcome(pdata);
++		if (mode != xgbe_phy_cur_mode(pdata)) {
++			netif_dbg(pdata, link, pdata->netdev,
++				  "Ext PHY changed interface mode to %d so AN is needed\n", mode);
++			*an_restart = 1;
++			goto out;
++		}
++
++		if (pdata->an_mode == XGBE_AN_MODE_MDIO)
++			pdata->an_result = XGBE_AN_COMPLETE;
++
++		if (enable_rx_adap(pdata, mode) && !pdata->rx_adapt_done) {
++			xgbe_phy_rx_adaptation(pdata);
++			msleep(200);
++		}
+ 	}
+ 
+ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1);
+@@ -2833,6 +2962,8 @@ static int xgbe_phy_link_status(struct xgbe_prv_data *pdata, int *an_restart)
+ 		xgbe_phy_rrc(pdata);
+ 	}
+ 
++out:
++	pdata->rx_adapt_done = false;
+ 	return 0;
+ }
+ 
+@@ -3149,6 +3280,9 @@ static void xgbe_phy_cdr_track(struct xgbe_prv_data *pdata)
+ 	if (!pdata->debugfs_an_cdr_workaround)
+ 		return;
+ 
++	if (pdata->vdata->an_kr_workaround > 1)
++		return;
++
+ 	if (!phy_data->phy_cdr_notrack)
+ 		return;
+ 
+@@ -3169,6 +3303,9 @@ static void xgbe_phy_cdr_notrack(struct xgbe_prv_data *pdata)
+ 	if (!pdata->debugfs_an_cdr_workaround)
+ 		return;
+ 
++	if (pdata->vdata->an_kr_workaround > 1)
++		return;
++
+ 	if (phy_data->phy_cdr_notrack)
+ 		return;
+ 
+@@ -3181,16 +3318,179 @@ static void xgbe_phy_cdr_notrack(struct xgbe_prv_data *pdata)
+ 	phy_data->phy_cdr_notrack = 1;
+ }
+ 
++static void xgbe_phy_kr_workaround(struct xgbe_prv_data *pdata)
++{
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++	unsigned int reg;
++
++	/* Disable KR training for now */
++	reg = XMDIO_READ(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL);
++	reg &= ~XGBE_KR_TRAINING_ENABLE;
++	XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL, reg);
++
++	/* step-4 Start AN */
++	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_CTRL1);
++	reg &= ~MDIO_AN_CTRL1_ENABLE;
++
++	reg |= MDIO_AN_CTRL1_ENABLE;
++
++	reg |= MDIO_AN_CTRL1_RESTART;
++
++	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_CTRL1, reg);
++
++	if (phy_data->cur_mode == XGBE_MODE_KR) {
++		/* step-4 Start AN with KR training auto start */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD,
++				 MDIO_PMA_10GBR_PMD_CTRL,
++				 (XGBE_KR_TRAINING_ENABLE | XGBE_KR_TRAINING_START),
++				 (XGBE_KR_TRAINING_ENABLE | XGBE_KR_TRAINING_START));
++
++		/* Step-5 Set RX_EQ_MGMT_MODE to disable RX Adapt Requests */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD,
++				 MDIO_PMA_RX_EQ_CTRL,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_MASK,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_ON);
++	}
++}
++
++static void xgbe_phy_kr_training_cdroff(struct xgbe_prv_data *pdata)
++{
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	/* set phy_data->phy_cdr_notrack, if it is not set so
++	 * next call to xgbe_phy_cdr_track will work as expected
++	 */
++
++	if (!phy_data->phy_cdr_notrack) {
++		netif_dbg(pdata, link, pdata->netdev, "setting phy_data->phy_cdr_notrack\n");
++		phy_data->phy_cdr_notrack = 1;
++	}
++}
++
++static void xgbe_phy_update_cdr_delay(struct xgbe_prv_data *pdata)
++{
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	/* step-13 Increment delay by 22ms. if delay is > 110ms, reset to 22ms */
++	if (phy_data->phy_cdr_delay < XGBE_CDR_DELAY_MAX)
++		phy_data->phy_cdr_delay += XGBE_CDR_DELAY_INC;
++	else
++		phy_data->phy_cdr_delay = XGBE_CDR_DELAY_INIT;
++}
++
++#define MAX_RX_VALID_RETRIES 10
++void rx_valid_check(struct xgbe_prv_data *pdata);
++void rx_valid_check(struct xgbe_prv_data *pdata)
++{
++	unsigned int reg = 0;
++	int check_rx_valid = 0;
++
++check_rx_valid:
++	reg = XMDIO_READ_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_LSTS,
++			XGBE_PMA_RX_VALID_0_MASK);
++
++	/* step 11: Check for RX_VALID */
++	if ((reg & XGBE_PMA_RX_VALID_0_MASK) != XGBE_PMA_RX_VALID_0_ENABLE) {
++		if (check_rx_valid++ >= MAX_RX_VALID_RETRIES) {
++			return;
++		}
++		usleep_range(500, 550);
++		goto check_rx_valid;
++	}
++}
++
++static void xgbe_phy_kr_training_post_v2(struct xgbe_prv_data *pdata)
++{
++	struct xgbe_phy_data *phy_data = pdata->phy_data;
++
++	/* an_kr_workaround is enabled with kr_training_post routine and
++	 * debugfs_an_cdr_track_early should be disabled
++	 */
++
++	if (pdata->debugfs_an_cdr_track_early)
++		return;
++
++	if (pdata->vdata->an_kr_workaround) {
++		/* step-7 Set RX_EQ_MGMT_MODE to disable RX adapt requests */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_EQ_CTRL,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_MASK, XGBE_PMA_RX_EQ_MGMT_MODE_ON);
++
++		/* step-8 Set rx_data_en =0 (Reference tracking mode) */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_CTRL0,
++				 XGBE_PMA_RX_DT_EN_0_MASK, XGBE_PMA_RX_DT_EN_0_OFF);
++	}
++	/* step-9 Delay and step-10 and Set CDR_TRACK_EN to 1 */
++	usleep_range(phy_data->phy_cdr_delay,
++		     phy_data->phy_cdr_delay + 500);
++
++	if (pdata->vdata->an_kr_workaround) {
++		/*step-10 rx_data_en = 1 (Data tracking mode) */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_CTRL0,
++				 XGBE_PMA_RX_DT_EN_0_MASK, XGBE_PMA_RX_DT_EN_0_ON);
++
++		/* step-11. Wait for RX_VALID_0 field of VR_XS_PMA_RX_LSTS register to indicate 1 (for CDR to lock to data)  */
++		rx_valid_check(pdata);
++
++		/* step-11  Clear RX_EQ_MGMT_MODE to allow RX Adapt rquests */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_EQ_CTRL,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_MASK, XGBE_PMA_RX_EQ_MGMT_MODE_OFF);
++	}
++}
++
++static void xgbe_phy_kr_training_post_v1(struct xgbe_prv_data *pdata)
++{
++	/* an_kr_workaround is enabled with kr_training_post routine and
++	 * debugfs_an_cdr_track_early should be disabled
++	 */
++
++	if (pdata->debugfs_an_cdr_track_early)
++		return;
++
++	if (pdata->vdata->an_kr_workaround) {
++		xgbe_phy_kr_training_cdroff(pdata);
++
++		/* step-7 Set RX_EQ_MGMT_MODE to disable RX adapt requests */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_EQ_CTRL,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_MASK, XGBE_PMA_RX_EQ_MGMT_MODE_OFF);
++		/* step-8 Set CDR_TRACK_EN to 0 */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_VEND2_PMA_CDR_CONTROL,
++				 XGBE_PMA_CDR_TRACK_EN_MASK,
++				 XGBE_PMA_CDR_TRACK_EN_OFF);
++		/* step-8 Set rx_data_en =0 (Reference tracking mode) */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_CTRL0,
++				 XGBE_PMA_RX_DT_EN_0_MASK, XGBE_PMA_RX_DT_EN_0_OFF);
++	}
++	/* step-9 Delay and step-10 and Set CDR_TRACK_EN to 1 */
++	xgbe_phy_cdr_track(pdata);
++
++	if (pdata->vdata->an_kr_workaround) {
++		/*step-10 rx_data_en = 1 (Data tracking mode) */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_CTRL0,
++				 XGBE_PMA_RX_DT_EN_0_MASK, XGBE_PMA_RX_DT_EN_0_ON);
++		/* step-11. Wait for 1 usec (for CDR to lock to data) */
++		usleep_range(1, 2);
++		/* step-11.  Clear RX_EQ_MGMT_MODE to allow RX Adapt rquests */
++		XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_EQ_CTRL,
++				 XGBE_PMA_RX_EQ_MGMT_MODE_MASK, XGBE_PMA_RX_EQ_MGMT_MODE_ON);
++	}
++}
++
+ static void xgbe_phy_kr_training_post(struct xgbe_prv_data *pdata)
+ {
+-	if (!pdata->debugfs_an_cdr_track_early)
+-		xgbe_phy_cdr_track(pdata);
++	if (pdata->vdata->an_kr_workaround > 1)
++		xgbe_phy_kr_training_post_v2(pdata);
++	else
++		xgbe_phy_kr_training_post_v1(pdata);
+ }
+ 
+ static void xgbe_phy_kr_training_pre(struct xgbe_prv_data *pdata)
+ {
+-	if (pdata->debugfs_an_cdr_track_early)
++	/* an_kr_workaround is not enabled with kr_training_pre routine */
++	if (pdata->debugfs_an_cdr_track_early) {
+ 		xgbe_phy_cdr_track(pdata);
++		/* step-12 Increment delay by 22ms. if delay is > 110ms, reset to 22ms */
++		xgbe_phy_update_cdr_delay(pdata);
++	}
+ }
+ 
+ static void xgbe_phy_an_post(struct xgbe_prv_data *pdata)
+@@ -3204,18 +3504,6 @@ static void xgbe_phy_an_post(struct xgbe_prv_data *pdata)
+ 			break;
+ 
+ 		xgbe_phy_cdr_track(pdata);
+-
+-		switch (pdata->an_result) {
+-		case XGBE_AN_READY:
+-		case XGBE_AN_COMPLETE:
+-			break;
+-		default:
+-			if (phy_data->phy_cdr_delay < XGBE_CDR_DELAY_MAX)
+-				phy_data->phy_cdr_delay += XGBE_CDR_DELAY_INC;
+-			else
+-				phy_data->phy_cdr_delay = XGBE_CDR_DELAY_INIT;
+-			break;
+-		}
+ 		break;
+ 	default:
+ 		break;
+@@ -3232,7 +3520,22 @@ static void xgbe_phy_an_pre(struct xgbe_prv_data *pdata)
+ 		if (phy_data->cur_mode != XGBE_MODE_KR)
+ 			break;
+ 
+-		xgbe_phy_cdr_notrack(pdata);
++		if (pdata->vdata->an_kr_workaround > 1) {
++			/* step-2 Set rx_data_en =0 (Reference tracking mode) */
++			XMDIO_WRITE_BITS(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_RX_CTRL0,
++					 XGBE_PMA_RX_DT_EN_0_MASK, XGBE_PMA_RX_DT_EN_0_OFF);
++			xgbe_phy_rrc(pdata);
++		} else
++			xgbe_phy_cdr_notrack(pdata);
++
++		if (pdata->vdata->an_kr_workaround) {
++			/* Enable interrupt when KR workaround is used */
++			XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK, XGBE_AN_CL73_INT_MASK);
++			/* Step 4 and step 5 for KR workaround
++			 * Start AN and disable RX Adapt Requests
++			 */
++			xgbe_phy_kr_workaround(pdata);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -3541,6 +3844,7 @@ static int xgbe_phy_init(struct xgbe_prv_data *pdata)
+ 		}
+ 
+ 		phy_data->phydev_mode = XGBE_MDIO_MODE_CL45;
++		pdata->vdata->an_kr_workaround = 0;
+ 		break;
+ 
+ 	/* 10GBase-R support */
+@@ -3677,4 +3981,5 @@ void xgbe_init_function_ptrs_phy_v2(struct xgbe_phy_if *phy_if)
+ 
+ 	phy_impl->module_info		= xgbe_phy_module_info;
+ 	phy_impl->module_eeprom		= xgbe_phy_module_eeprom;
++	phy_impl->update_cdr_delay	= xgbe_phy_update_cdr_delay;
+ }
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index d7e03e292ec4..1331a174d763 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -488,6 +488,7 @@ enum xgbe_an_mode {
+ 	XGBE_AN_MODE_CL73_REDRV,
+ 	XGBE_AN_MODE_CL37,
+ 	XGBE_AN_MODE_CL37_SGMII,
++	XGBE_AN_MODE_MDIO,
+ 	XGBE_AN_MODE_NONE,
+ };
+ 
+@@ -629,8 +630,12 @@ struct xgbe_mmc_stats {
+ 	u64 txframecount_g;
+ 	u64 txpauseframes;
+ 	u64 txvlanframes_g;
++	u64 tx_errors;
++	u64 tx_dropped;
+ 
+ 	/* Rx Stats */
++	u64 rx_errors;
++	u64 rx_dropped;
+ 	u64 rxframecount_gb;
+ 	u64 rxoctetcount_gb;
+ 	u64 rxoctetcount_g;
+@@ -839,6 +844,7 @@ struct xgbe_phy_impl_if {
+ 			   struct ethtool_modinfo *modinfo);
+ 	int (*module_eeprom)(struct xgbe_prv_data *pdata,
+ 			     struct ethtool_eeprom *eeprom, u8 *data);
++	void (*update_cdr_delay)(struct xgbe_prv_data *pdata);
+ };
+ 
+ struct xgbe_phy_if {
+@@ -959,6 +965,7 @@ struct xgbe_version_data {
+ 	unsigned int rx_desc_prefetch;
+ 	unsigned int an_cdr_workaround;
+ 	unsigned int enable_rrc;
++	unsigned int an_kr_workaround;
+ };
+ 
+ struct xgbe_prv_data {
+@@ -1175,6 +1182,7 @@ struct xgbe_prv_data {
+ 	struct xgbe_phy phy;
+ 	int mdio_mmd;
+ 	unsigned long link_check;
++	unsigned long phy_link_check;
+ 	struct completion mdio_complete;
+ 
+ 	unsigned int kr_redrv;
