@@ -163,6 +163,53 @@ ethtool nic0 | grep "Speed\|Link detected"
 # Expected: Speed: 10000Mb/s, Link detected: yes
 ```
 
+## Known quirks
+
+### Auto-neg unreliable with multi-speed advertise; pin to a single speed
+
+With the patched driver loaded and a healthy cable/link partner, auto-negotiation does not reliably converge when the kernel-default set (1G + 2.5G + 10G) is advertised. Symptoms seen on AS6806T + direct copper to a 10G PC NIC:
+
+- Link occasionally comes up briefly at 10G during early boot, then drops and never re-establishes
+- After the drop, no amount of `ifdown/ifup`, bridge bounce, or `modprobe -r amd_xgbe; modprobe amd_xgbe` restores the link — driver/PHY reload completes cleanly but AN never succeeds
+- Restricting advertise to a **single** speed (`0x020` for 1G or `0x1000` for 10G) reliably negotiates that speed on the next link bounce
+- 2.5G alone does not negotiate against this particular PC NIC (no 2.5GBase-T support on that side)
+
+The driver/patch side is fine — patched module loads from `/lib/modules/$(uname -r)/updates/dkms/amd-xgbe.ko`, `aquantia` is loaded before it, dmesg shows clean driver init. This is an AQR113C/xgbe AN-state-machine quirk that the [0035 patch](kernel-6.17/as6806t-xgbe-combined.patch) partly mitigates but does not fully eliminate.
+
+**Workaround:** pin the advertise mask to 10G only via a `pre-up` in `/etc/network/interfaces`:
+
+```
+auto nic0
+iface nic0 inet manual
+    pre-up /sbin/ip link set $IFACE down 2>/dev/null || true
+    pre-up /sbin/ethtool -s $IFACE advertise 0x1000
+```
+
+(`0x1000` = `10000baseT/Full` only. The `pre-up ip link down` ensures AN actually re-runs against the new advertise mask — setting `advertise` on an already-up link does not force renegotiation.)
+
+Verify after `ifdown vmbr1 ; ifup vmbr1`:
+
+```
+Advertised link modes:  10000baseT/Full
+Speed: 10000Mb/s
+Link detected: yes
+```
+
+### Diagnosing "10GbE stopped working after a kernel upgrade"
+
+Most of the time, DKMS has done its job and the issue is elsewhere. Quick triage:
+
+```bash
+uname -r
+dkms status                                                # entry for running kernel must say "installed"
+modinfo amd-xgbe | grep filename                           # must point to .../updates/dkms/amd-xgbe.ko
+lsmod | grep -E 'aquantia|amd_xgbe'                        # both must be loaded; aquantia first
+journalctl -k -b 0 | grep -iE 'xgbe|aquantia|aqr'          # look for "Link is Up" / "Link is Down" events
+ethtool nic0 | grep -E 'Advertised|Speed|Auto-neg|Link'    # check AN state and advertised modes
+```
+
+If `dkms status` shows the patched module installed for the running kernel **and** `modinfo` resolves to the `updates/dkms/` path, the patch side is healthy — investigate AN/PHY/cable next (see quirk above).
+
 ## Compatibility
 
 | Kernel | Status |
